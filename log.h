@@ -13,7 +13,7 @@ enum log_importance {
     LOG_IMPORTANCE_LAST,
 };
 
-void swayidle_log_init(enum log_importance verbosity);
+void swayidle_log_set_min_verbosity(enum log_importance verbosity);
 
 #ifdef __GNUC__
 #define _ATTRIB_PRINTF(start, end) __attribute__((format(printf, start, end)))

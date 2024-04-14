@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client-protocol.h>
@@ -20,6 +21,7 @@
 #if HAVE_SYSTEMD
 #include <systemd/sd-bus.h>
 #include <systemd/sd-login.h>
+#include <systemd/sd-daemon.h>
 #elif HAVE_ELOGIND
 #include <elogind/sd-bus.h>
 #include <elogind/sd-login.h>
@@ -78,9 +80,20 @@ static const char *verbosity_colors[] = {
 	[LOG_DEBUG ] = "\x1B[1;30m",
 };
 
+#if HAVE_SYSTEMD
+bool systemd_journal_log = false;
+
+static const char *verbosity_systemd[] = {
+	[LOG_SILENT] = "",
+	[LOG_ERROR] = SD_ERR,
+	[LOG_INFO] = SD_INFO,
+	[LOG_DEBUG] = SD_DEBUG,
+};
+#endif
+
 static enum log_importance log_importance = LOG_INFO;
 
-void swayidle_log_init(enum log_importance verbosity) {
+void swayidle_log_set_min_verbosity(enum log_importance verbosity) {
 	if (verbosity < LOG_IMPORTANCE_LAST) {
 		log_importance = verbosity;
 	}
@@ -94,18 +107,27 @@ void _swayidle_log(enum log_importance verbosity, const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
 
-	// prefix the time to the log message
-	struct tm result;
-	time_t t = time(NULL);
-	struct tm *tm_info = localtime_r(&t, &result);
-	char buffer[26];
-
-	// generate time prefix
-	strftime(buffer, sizeof(buffer), "%F %T - ", tm_info);
-	fprintf(stderr, "%s", buffer);
-
 	unsigned c = (verbosity < LOG_IMPORTANCE_LAST)
 		? verbosity : LOG_IMPORTANCE_LAST - 1;
+
+#if HAVE_SYSTEMD
+	if (systemd_journal_log) {
+		fprintf(stderr, "%s", verbosity_systemd[c]);
+	}
+	else
+#endif
+
+	{
+		// prefix the time to the log message
+		struct tm result;
+		time_t t = time(NULL);
+		struct tm *tm_info = localtime_r(&t, &result);
+		char buffer[26];
+
+		// generate time prefix
+		strftime(buffer, sizeof(buffer), "%F %T - ", tm_info);
+		fprintf(stderr, "%s", buffer);
+	}
 
 	if (isatty(STDERR_FILENO)) {
 		fprintf(stderr, "%s", verbosity_colors[c]);
@@ -560,7 +582,7 @@ static void setup_property_changed_listener(void) {
 }
 
 static uint32_t handle_screensaver_inhibit(const char *sender, const char *app_name, const char *reason) {
-	swayidle_log(LOG_INFO, DBUS_SCREENSAVER_INTERFACE ".Inhibit('%s', '%s') from %s", app_name, reason, sender);
+	swayidle_log(LOG_DEBUG, DBUS_SCREENSAVER_INTERFACE ".Inhibit('%s', '%s') from %s", app_name, reason, sender);
 
 	uint32_t cookie;
 	bool cookie_ok = false;
@@ -590,7 +612,7 @@ static uint32_t handle_screensaver_inhibit(const char *sender, const char *app_n
 }
 
 static void handle_screensaver_uninhibit(const char *sender, uint32_t cookie) {
-	swayidle_log(LOG_INFO, DBUS_SCREENSAVER_INTERFACE ".UnInhibit(%" PRIu32 ") from %s", cookie, sender);
+	swayidle_log(LOG_DEBUG, DBUS_SCREENSAVER_INTERFACE ".UnInhibit(%" PRIu32 ") from %s", cookie, sender);
 
 	int count = 0;
 
@@ -606,7 +628,7 @@ static void handle_screensaver_uninhibit(const char *sender, uint32_t cookie) {
 		}
 	}
 	if (count == 0) {
-		swayidle_log(LOG_INFO, "No matching inhibitor found for UnInhibit method call");
+		swayidle_log(LOG_INFO, "No matching inhibitor found for UnInhibit method call. cookie=%"PRIu32 " sender=%s", cookie, sender);
 	}
 
 	update_timeouts();
@@ -820,12 +842,7 @@ static void enable_timeouts(void) {
 	if (state.timeouts_enabled) {
 		return;
 	}
-#if HAVE_SYSTEMD || HAVE_ELOGIND
-	if (get_logind_idle_inhibit()) {
-		swayidle_log(LOG_INFO, "Not enabling timeouts: idle inhibitor found");
-		return;
-	}
-#endif
+
 	swayidle_log(LOG_DEBUG, "Enable idle timeouts");
 
 	state.timeouts_enabled = true;
@@ -1081,7 +1098,7 @@ static int parse_args(int argc, char *argv[], char **config_path) {
 			*config_path = strdup(optarg);
 			break;
 		case 'd':
-			swayidle_log_init(LOG_DEBUG);
+			swayidle_log_set_min_verbosity(LOG_DEBUG);
 			break;
 		case 'w':
 			state.wait = true;
@@ -1270,10 +1287,58 @@ static int load_config(const char *config_path) {
 	return 0;
 }
 
+#if HAVE_SYSTEMD
+static bool is_stderr_systemd_journal(void) {
+
+	const char* journal_stream = getenv("JOURNAL_STREAM");
+	if (!journal_stream) {
+		swayidle_log(LOG_INFO, "Not using systemd logging - no JOURNAL_STREAM environment variable");
+		return false;
+	}
+
+	char *after_device;
+	unsigned long var_device_no = strtoul(journal_stream, &after_device, 10);
+
+	if (after_device == journal_stream || *after_device != ':') {
+		swayidle_log(LOG_INFO, "Not using systemd logging - failed to parse JOURNAL_STREAM '%s'", journal_stream);
+		return false;
+	}
+
+	char *after_inode;
+	unsigned long var_inode_no = strtoul(after_device + 1 /* skip ':' */, &after_inode, 10);
+
+	if (after_inode == after_device || *after_inode != '\0') {
+		swayidle_log(LOG_INFO, "Not using systemd logging - failed to parse JOURNAL_STREAM '%s'", journal_stream);
+		return false;
+	}
+
+	struct stat stderr_stat;
+	int ret = fstat(STDERR_FILENO, &stderr_stat);
+	if (ret < 0) {
+		swayidle_log_errno(LOG_INFO, "Not using systemd logging - failed to stat stderr");
+		return false;
+	}
+
+	if (var_device_no == stderr_stat.st_dev && var_inode_no == stderr_stat.st_ino) {
+		return true;
+	} else {
+		swayidle_log(LOG_INFO, "Not using systemd logging - stderr does not match JOURNAL_STREAM '%s'", journal_stream);
+		return false;
+	}
+}
+#endif
 
 int main(int argc, char *argv[]) {
 	srand(time(NULL));
 	swayidle_init();
+
+#if HAVE_SYSTEMD
+	if (is_stderr_systemd_journal()) {
+		systemd_journal_log = true;
+		swayidle_log(LOG_INFO, "Using systemd logging");
+	}
+#endif
+
 	char *config_path = NULL;
 	if (parse_args(argc, argv, &config_path) != 0) {
 		swayidle_finish();
