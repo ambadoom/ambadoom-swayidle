@@ -65,7 +65,8 @@ endif
 config_header = configure_file(output: 'config.h', configuration: conf_data)
 
 executable(
-	'swayidle', [
+	'swayidle',
+        [
 		'main.c',
 		protos_src,
 		config_header,
